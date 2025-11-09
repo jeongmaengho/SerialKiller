@@ -12,30 +12,28 @@
  *
  * Dual-Licensed Software: Apache v2.0 and GPL v2.0
  */
+// Modified by Bizflow Corp., 2025-11-09
 package org.nibblesec.tools;
 
-import static java.util.Objects.requireNonNull;
+import org.apache.commons.configuration2.XMLConfiguration;
+import org.apache.commons.configuration2.builder.ReloadingFileBasedConfigurationBuilder;
+import org.apache.commons.configuration2.builder.fluent.Parameters;
+import org.apache.commons.configuration2.ex.ConfigurationException;
+import org.apache.commons.configuration2.reloading.PeriodicReloadingTrigger;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InvalidClassException;
-import java.io.ObjectInputStream;
-import java.io.ObjectStreamClass;
-import java.util.Map;
+import java.io.*;
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.Iterator;
-import java.util.Set;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
-import org.apache.commons.configuration.ConfigurationException;
-import org.apache.commons.configuration.XMLConfiguration;
-import org.apache.commons.configuration.reloading.FileChangedReloadingStrategy;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import static java.util.Objects.requireNonNull;
 
 public class SerialKiller extends ObjectInputStream {
 
@@ -63,7 +61,11 @@ public class SerialKiller extends ObjectInputStream {
 
     @Override
     protected Class<?> resolveClass(final ObjectStreamClass serialInput) throws IOException, ClassNotFoundException {
-        config.reloadIfNeeded();
+        try {
+            config.reloadIfNeeded();
+        } catch (ConfigurationException e) {
+            throw new RuntimeException(e);
+        }
 
         // Enforce SerialKiller's blacklist
         for (Pattern blackPattern : config.blacklist()) {
@@ -110,21 +112,38 @@ public class SerialKiller extends ObjectInputStream {
     }
 
     static final class Configuration {
-        private final XMLConfiguration config;
+        private ReloadingFileBasedConfigurationBuilder<XMLConfiguration> builder;
+        private XMLConfiguration config;
 
         private PatternList blacklist;
         private PatternList whitelist;
+        private File configFile;
 
         Configuration(final String configPath) {
             try {
-                config = new XMLConfiguration(configPath);
+                if (null == configPath) {
+                    throw new ConfigurationException("configPath is null");
+                }
+                configFile = new File(configPath);
+                if (configFile.length() == 0 || !configFile.exists() || !configFile.canRead()) {
+                    throw new ConfigurationException("configPath is invalid: " + configPath);
+                }
 
-                FileChangedReloadingStrategy reloadStrategy = new FileChangedReloadingStrategy();
-                reloadStrategy.setRefreshDelay(config.getLong("refresh", 6000));
-                config.setReloadingStrategy(reloadStrategy);
-                config.addConfigurationListener(event -> init(config));
+                Parameters params = new Parameters();
+                builder =
+                        new ReloadingFileBasedConfigurationBuilder<>(XMLConfiguration.class)
+                                .configure(params.xml()
+                                        .setFile(configFile)
+                                        .setValidating(false)
+                                );
 
+                PeriodicReloadingTrigger trigger =
+                        new PeriodicReloadingTrigger(builder.getReloadingController(), null, 6, TimeUnit.SECONDS);
+                trigger.start();
+
+                config = builder.getConfiguration();
                 init(config);
+
             } catch (ConfigurationException | PatternSyntaxException e) {
                 throw new IllegalStateException("SerialKiller not properly configured: " + e.getMessage(), e);
             }
@@ -135,9 +154,12 @@ public class SerialKiller extends ObjectInputStream {
             whitelist = new PatternList(config.getStringArray("whitelist.regexps.regexp"));
         }
 
-        void reloadIfNeeded() {
-            // NOTE: Unfortunately, this will invoke synchronized blocks in Commons Configuration
-            config.reload();
+        void reloadIfNeeded() throws ConfigurationException, IOException {
+            if (null != builder) {
+                builder.getReloadingController().checkForReloading(null);
+                config = builder.getConfiguration();
+                init(config);
+            }
         }
 
         Iterable<Pattern> blacklist() {
@@ -149,6 +171,9 @@ public class SerialKiller extends ObjectInputStream {
         }
 
         boolean isProfiling() {
+            if (null == config) {
+                return false;
+            }
             return config.getBoolean("mode.profiling", false);
         }
     }
